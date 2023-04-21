@@ -1,0 +1,133 @@
+@Library("mylib@feature-k8s") _     //加载共享库
+import org.devops.*      
+
+env.namespace = "jenkins"
+env.agentName = "jenkinsagent${UUID.randomUUID().toString()[0..7]}"
+
+
+pipeline {
+    agent {
+        label "build01"
+    }
+    stages{
+        stage("CreateBuildENV"){
+            steps{
+                script{
+                    // Get agent create script
+                    scriptContent = libraryResource 'scripts/create_jenkins_agent.groovy'
+                    scriptContent = scriptContent.replaceAll("__AGENT_NAME__","${env.agentName}")
+                    writeFile file: 'create_jenkins_agent.groovy', text: scriptContent
+
+                    // Run agent create script
+                    jenkinsCrumb = GetCrumb()
+                    agentConfig = RunScriptConsole("create_jenkins_agent.groovy", jenkinsCrumb)
+
+                    // Get pod template
+                    podTamplate = libraryResource "scripts/jenkins_k8s_pod.yaml"
+                    writeFile file: 'jenkins_k8s_pod.yaml', text: podTamplate
+
+                    //replace variables
+                    sh """
+                      sed -i 's#__AGENT_NAME__#${env.agentName}#g' jenkins_k8s_pod.yaml
+                      sed -i 's#__NAMESPACE__#${env.namespace}#g' jenkins_k8s_pod.yaml
+                      sed -i 's#__JENKINS_URL__#${agentConfig.jenkinsUrl}#g' jenkins_k8s_pod.yaml
+                      sed -i 's#__JENKINS_SECRET__#${agentConfig.computerSecret}#g' jenkins_k8s_pod.yaml
+                      cat jenkins_k8s_pod.yaml
+                    """
+
+                    //Create kubernetes pod
+                    podYaml = sh returnStdout: true, script:  "cat jenkins_k8s_pod.yaml"
+                    CreatePod("${env.namespace}", podYaml)
+
+                }
+            }
+        }
+
+        stage("Build"){
+            agent{
+                label "${env.agentName}"
+                customWorkspace "/home/jenkins/workspace"
+            }
+            steps{
+                script{
+                    sh "sleep 10"
+                }
+            }
+        }
+
+        stage("CleanBuildENV"){
+            steps{
+                script{
+                    //Delete kubernetes agent pod
+                    DeletePod("${env.namespace}", "${env.agentName}")
+
+                    //Delete jenkins agent
+                    // Get agent delete script
+                    scriptContent = libraryResource 'scripts/delete_jenkins_agent.groovy'
+                    scriptContent = scriptContent.replaceAll("__AGENT_NAME__","${env.agentName}")
+                    writeFile file: 'delete_jenkins_agent.groovy', text: scriptContent
+
+                    // Run agent create script
+                    jenkinsCrumb = GetCrumb()
+                    agentConfig = RunScriptConsole("delete_jenkins_agent.groovy", jenkinsCrumb)
+                }
+            }
+        }
+    }
+}
+
+//删除POD
+def DeletePod(namespace, podName){
+    withCredentials([string(credentialsId: 'f66733bf-ef35-402d-87d1-a79510387d2b', variable: 'CICDTOKEN')]) {
+        sh """
+           curl --location --request DELETE "https://192.168.1.200:6443/api/v1/namespaces/${namespace}/pods/${podName}" \
+           --header "Authorization: Bearer ${CICDTOKEN}" \
+           --insecure
+        """
+    }
+}
+
+// 创建POD
+def CreatePod(namespace, podYaml){
+    withCredentials([string(credentialsId: 'f66733bf-ef35-402d-87d1-a79510387d2b', variable: 'CICDTOKEN')]) {
+        sh """
+           curl --location --request POST "https://192.168.1.200:6443/api/v1/namespaces/${namespace}/pods" \
+           --header 'Content-Type: application/yaml' \
+           --header "Authorization: Bearer ${CICDTOKEN}" \
+           --data "${podYaml}" --insecure
+        """
+    }
+}
+
+// ScriptConsole运行脚本
+def RunScriptConsole(scriptContent, crumb){
+    response = sh returnStdout: true, 
+                  script: """
+                    curl -s -d "script=\$(cat ${scriptContent})" \
+                    --header "Jenkins-Crumb:${crumb}" \
+                    -X  POST http://admin:112374bd5c557010386b55bb85a777aded@192.168.1.200:8080/scriptText
+                    """
+    try {
+        response = readJSON text: response - "Result: "
+    } catch(e){
+        println(e)
+    }
+    return response
+}
+
+
+// 获取Crumb值
+def GetCrumb(){
+    response = sh returnStdout: true, 
+                  script: """ curl -s -u admin:admin \
+                                   --location \
+                                   --request GET 'http://192.168.1.200:8080/crumbIssuer/api/json' """
+    response = readJSON text: response
+    return  response.crumb
+}
+
+
+
+
+
+
